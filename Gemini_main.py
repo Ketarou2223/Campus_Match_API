@@ -98,6 +98,16 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     except Exception:
         raise HTTPException(status_code=401, detail="有効なトークンが必要です")
 
+async def get_admin_user(user = Depends(get_current_user)):
+    """
+    現在のユーザーが管理者(is_admin=True)かどうかをチェックします。
+    （管理画面のAPIを守るための専用の関門です）
+    """
+    res = supabase.table("profiles").select("is_admin").eq("id", user.id).single().execute()
+    if not res.data or not res.data.get("is_admin"):
+        raise HTTPException(status_code=403, detail="管理者権限がありません。この操作は禁止されています。")
+    return user
+
 def calculate_age(birthday: date) -> int:
     today = date.today()
     return today.year - birthday.year - ((today.month, today.day) < (birthday.month, birthday.day))
@@ -150,7 +160,16 @@ async def signup(user_info: UserRegistration):
 async def login(credentials: UserLogin):
     try:
         res = supabase.auth.sign_in_with_password({"email": credentials.email, "password": credentials.password})
-        return {"access_token": res.session.access_token, "user_id": res.user.id}
+        
+        # profilesテーブルからis_adminを取得してフロントに教える
+        profile_res = supabase.table("profiles").select("is_admin").eq("id", res.user.id).single().execute()
+        is_admin = profile_res.data.get("is_admin", False) if profile_res.data else False
+        
+        return {
+            "access_token": res.session.access_token, 
+            "user_id": res.user.id,
+            "is_admin": is_admin
+        }
     except Exception:
         raise HTTPException(status_code=401, detail="メールアドレスまたはパスワードが正しくありません")
 
@@ -356,9 +375,52 @@ async def mark_messages_as_read(match_id: int, user=Depends(get_current_user)):
     supabase.table("messages").update({"is_read": True}).eq("match_id", match_id).neq("sender_id", user.id).execute()
     return {"message": "メッセージを既読にしました"}
 
-# --- 管理者用（簡易） ---
+# --- 管理者用（Admin） ---
+
+@app.get("/admin/users/pending", summary="【運営用】未承認ユーザー一覧の取得", tags=["管理"])
+async def get_pending_users(admin_user=Depends(get_admin_user)):
+    """
+    学生証の確認が終わっていないユーザーの一覧を取得します。
+    """
+    # is_verifiedがFalseまたはNULLのユーザーを取得
+    res_null = supabase.table("profiles").select("*").is_("is_verified", "null").execute()
+    res_false = supabase.table("profiles").select("*").eq("is_verified", False).execute()
+    
+    pending_users = res_null.data + res_false.data
+    
+    # 各ユーザーの学生証画像のURLベースを生成
+    for user in pending_users:
+        user['student_id_image_path'] = f"verifications/{user['id']}_student_id" 
+    
+    return pending_users
 
 @app.put("/admin/verify/{user_id}", summary="【運営用】ユーザーの承認", tags=["管理"])
-async def verify_student(user_id: str, admin_user=Depends(get_current_user)):
+async def verify_student(user_id: str, admin_user=Depends(get_admin_user)):
+    """
+    ユーザーの学生証を目視確認した後、このAPIを叩いて承認済み(is_verified=True)にします。
+    """
     supabase.table("profiles").update({"is_verified": True}).eq("id", user_id).execute()
     return {"message": "ユーザーを承認済みステータスに変更しました"}
+
+@app.get("/admin/stats", summary="【運営用】統計データの取得", tags=["管理"])
+async def get_admin_stats(admin_user=Depends(get_admin_user)):
+    """
+    現在のアプリの利用状況（総登録者数、マッチング数など）を取得します。
+    """
+    try:
+        profiles_res = supabase.table("profiles").select("id", count="exact").execute()
+        total_users = profiles_res.count if hasattr(profiles_res, 'count') else len(profiles_res.data)
+        
+        matches_res = supabase.table("matches").select("id", count="exact").execute()
+        total_matches = matches_res.count if hasattr(matches_res, 'count') else len(matches_res.data)
+        
+        messages_res = supabase.table("messages").select("id", count="exact").execute()
+        total_messages = messages_res.count if hasattr(messages_res, 'count') else len(messages_res.data)
+        
+        return {
+            "total_users": total_users,
+            "total_matches": total_matches,
+            "total_messages": total_messages
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
