@@ -2,8 +2,9 @@ import os
 from datetime import date
 from typing import List, Optional
 
-from fastapi import FastAPI, UploadFile, File, Header, HTTPException, Depends, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials # ←追加
 from pydantic import BaseModel, EmailStr
 from supabase import create_client, Client
 from dotenv import load_dotenv
@@ -13,7 +14,7 @@ load_dotenv()
 app = FastAPI(
     title="CAMPUS MATCH API",
     description="大阪大学限定マッチングアプリのバックエンドAPIです。認証、プロフィール管理、マッチング、ブロック、チャット、通報、退会機能などを提供します。",
-    version="1.2.0"
+    version="1.2.1"
 )
 
 app.add_middleware(
@@ -28,6 +29,9 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# --- セキュリティ設定 ---
+security = HTTPBearer() # ←追加
+
 # --- データモデル ---
 
 class UserRegistration(BaseModel):
@@ -40,7 +44,7 @@ class UserRegistration(BaseModel):
     major: str
     student_id: str
     phone: str
-    agreed_to_terms: bool # 追加：利用規約への同意フラグ
+    agreed_to_terms: bool
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -67,7 +71,6 @@ class BlockRequest(BaseModel):
     target_user_id: str
 
 class ReportRequest(BaseModel):
-    """通報用のモデル"""
     target_user_id: str
     reason: str
 
@@ -76,15 +79,18 @@ class MessageCreate(BaseModel):
     content: str
 
 class DeviceTokenRequest(BaseModel):
-    """プッシュ通知トークン用のモデル"""
     token: str
 
 # --- 共通処理 ---
 
-async def get_current_user(authorization: str = Header(...)):
-    """ヘッダーのBearerトークンを検証してユーザー情報を取得する内部関数です。"""
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """
+    ヘッダーのBearerトークンを検証してユーザー情報を取得します。
+    Swagger UIでは右上の「Authorize」ボタンからトークンを設定してください。
+    """
     try:
-        token = authorization.replace("Bearer ", "")
+        # credentials.credentials には "Bearer " が除かれたトークン本体が入っています
+        token = credentials.credentials
         user_response = supabase.auth.get_user(token)
         if not user_response.user:
             raise HTTPException(status_code=401, detail="認証に失敗しました")
@@ -115,10 +121,6 @@ async def get_blocked_user_ids(current_user_id: str) -> List[str]:
 
 @app.post("/auth/signup", summary="新規アカウント登録", tags=["認証"])
 async def signup(user_info: UserRegistration):
-    """
-    アカウントを作成し、profilesテーブルに初期情報を保存します。
-    利用規約への同意 (agreed_to_terms = true) が必須です。
-    """
     if not user_info.agreed_to_terms:
         raise HTTPException(status_code=400, detail="利用規約およびプライバシーポリシーへの同意が必要です")
 
@@ -154,10 +156,6 @@ async def login(credentials: UserLogin):
 
 @app.delete("/auth/withdraw", summary="退会処理", tags=["認証"])
 async def withdraw(user=Depends(get_current_user)):
-    """
-    アプリから退会します。プロフィールデータを削除し、他のユーザーから見えなくします。
-    """
-    # 実際にはカスケード削除により、likesやmatchesも一緒に消えるようにDB側で設定します
     supabase.table("profiles").delete().eq("id", user.id).execute()
     return {"message": "退会処理が完了しました。ご利用ありがとうございました。"}
 
@@ -232,9 +230,6 @@ async def update_my_profile(data: ProfileUpdate, user=Depends(get_current_user))
 
 @app.post("/profile/upload-avatar", summary="プロフィール写真のアップロード", tags=["プロフィール"])
 async def upload_avatar(file: UploadFile = File(...), user=Depends(get_current_user)):
-    """
-    他のユーザーに見せるためのプロフィール写真をアップロードします。
-    """
     file_content = await file.read()
     file_ext = file.filename.split(".")[-1]
     file_path = f"{user.id}/avatar.{file_ext}"
@@ -247,11 +242,10 @@ async def upload_avatar(file: UploadFile = File(...), user=Depends(get_current_u
 
 @app.post("/profile/device-token", summary="プッシュ通知用トークンの登録", tags=["プロフィール"])
 async def register_device_token(req: DeviceTokenRequest, user=Depends(get_current_user)):
-    """スマホアプリ側で取得した通知用デバイストークンを保存します。"""
     supabase.table("profiles").update({"device_token": req.token}).eq("id", user.id).execute()
     return {"message": "プッシュ通知の設定を保存しました"}
 
-# --- アクション（いいね・マッチ・ブロック・通報） ---
+# --- アクション ---
 
 @app.get("/interactions/matches", summary="マッチング一覧の取得", tags=["アクション"])
 async def get_my_matches(user=Depends(get_current_user)):
@@ -322,7 +316,6 @@ async def unblock_user(target_user_id: str, user=Depends(get_current_user)):
 
 @app.post("/interactions/report", summary="悪質なユーザーの通報", tags=["アクション"])
 async def report_user(req: ReportRequest, user=Depends(get_current_user)):
-    """利用規約に違反しているユーザーを運営に報告します。"""
     supabase.table("reports").insert({
         "reporter_id": user.id,
         "reported_id": req.target_user_id,
@@ -356,24 +349,16 @@ async def send_message(msg: MessageCreate, user=Depends(get_current_user)):
 
 @app.put("/chat/{match_id}/read", summary="メッセージの既読処理", tags=["チャット"])
 async def mark_messages_as_read(match_id: int, user=Depends(get_current_user)):
-    """
-    相手から送られてきたメッセージを一括で「既読」状態にします。
-    """
     match_res = supabase.table("matches").select("*").eq("id", match_id).execute()
     if not match_res.data or (match_res.data[0]['user_a'] != user.id and match_res.data[0]['user_b'] != user.id):
         raise HTTPException(status_code=403, detail="権限がありません")
 
-        # 自分宛てのメッセージ（送信者が自分以外）を既読にする
-        supabase.table("messages").update({"is_read": True}).eq("match_id", match_id).neq("sender_id", user.id).execute()
-        return {"message": "メッセージを既読にしました"}
+    supabase.table("messages").update({"is_read": True}).eq("match_id", match_id).neq("sender_id", user.id).execute()
+    return {"message": "メッセージを既読にしました"}
 
 # --- 管理者用（簡易） ---
 
 @app.put("/admin/verify/{user_id}", summary="【運営用】ユーザーの承認", tags=["管理"])
 async def verify_student(user_id: str, admin_user=Depends(get_current_user)):
-    """
-    アップロードされた学生証を目視確認した後、このAPIを叩いてユーザーを「承認済み」にします。
-    （※本番運用では admin_user が管理者権限を持っているかのチェックを追加します）
-    """
     supabase.table("profiles").update({"is_verified": True}).eq("id", user_id).execute()
     return {"message": "ユーザーを承認済みステータスに変更しました"}
